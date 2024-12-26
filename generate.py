@@ -6,6 +6,8 @@ References:
 import torch
 from dit import DiT_models
 from vae import VAE_models
+import torchvision.transforms as T
+from torchvision.utils import save_image
 from torchvision.io import read_video, write_video
 from utils import load_prompt, load_actions, sigmoid_beta_schedule
 from tqdm import tqdm
@@ -19,10 +21,15 @@ import os
 assert torch.cuda.is_available()
 device = "cuda:0"
 
+torch.cuda.set_per_process_memory_fraction(0.9)  # prevent crashes
 
 def main(args):
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
+
+    # Ensure the output directory exists
+    output_dir = os.path.join(os.path.dirname(args.output_path), "frames")
+    os.makedirs(output_dir, exist_ok=True)
 
     # load DiT checkpoint
     model = DiT_models["DiT-S/2"]()
@@ -120,19 +127,40 @@ def main(args):
                 alpha_next[:, -1:] = torch.ones_like(alpha_next[:, -1:])
             x_pred = alpha_next.sqrt() * x_start + x_noise * (1 - alpha_next).sqrt()
             x[:, -1:] = x_pred[:, -1:]
+        
+        if args.otf_vae_decode:
+            # Decode the latent of last frame to a full frame using the VAE
+            x_decoded = rearrange(x[:, -1:], "b t c h w -> (b t) (h w) c")
+            with torch.no_grad():
+                x_decoded = (vae.decode(x_decoded / scaling_factor) + 1) / 2
+            x_decoded = rearrange(x_decoded, "(b t) c h w -> b t c h w", t=1)[0, 0]
 
-    # vae decoding
-    x = rearrange(x, "b t c h w -> (b t) (h w) c")
-    with torch.no_grad():
-        x = (vae.decode(x / scaling_factor) + 1) / 2
-    x = rearrange(x, "(b t) c h w -> b t h w c", t=total_frames)
+            # Save the decoded frame to the specified folder
+            frame = x_decoded.cpu()
 
-    # save video
-    x = torch.clamp(x, 0, 1)
-    x = (x * 255).byte()
-    write_video(args.output_path, x[0].cpu(), fps=args.fps)
-    print(f"generation saved to {args.output_path}.")
+            frame = torch.clamp(frame, 0, 1)
+            frame = (frame * 255).byte()
+            frame = T.ToPILImage()(frame)
+            frame.save(os.path.join(output_dir, f"frame_{i:04d}.png"))
 
+    if not args.otf_vae_decode:
+        # vae decoding
+        x = rearrange(x, "b t c h w -> (b t) (h w) c")
+        with torch.no_grad():
+            x = (vae.decode(x / scaling_factor) + 1) / 2
+        x = rearrange(x, "(b t) c h w -> b t h w c", t=total_frames)
+
+        # save video
+        x = torch.clamp(x, 0, 1)
+        x = (x * 255).byte()
+        write_video(args.output_path, x[0].cpu(), fps=args.fps)
+        print(f"generation saved to {args.output_path}.")
+    else:
+        del x
+        # concat frames to make video
+        os.system(f"ffmpeg -r {args.fps} -pattern_type glob -i '{output_dir}/*.png' -c:v libx264 -vf fps={args.fps} -pix_fmt yuv420p {args.output_path}")
+
+        # TODO delete generated_frames folder if it exists
 
 if __name__ == "__main__":
     parse = argparse.ArgumentParser()
@@ -191,9 +219,20 @@ if __name__ == "__main__":
         help="What framerate should be used to save the output?",
         default=20,
     )
-    parse.add_argument("--ddim-steps", type=int, help="How many DDIM steps?", default=10)
+    parse.add_argument(
+        "--ddim-steps", 
+        type=int, 
+        help="How many DDIM steps?", 
+        default=16)
+    
+    parse.add_argument(
+        "--otf-vae-decode",
+        action='store_true', 
+        help="Performs On-The-Fly decoding of the denoised latent using the VAE",
+        default=False)
 
     args = parse.parse_args()
     print("inference args:")
     pprint(vars(args))
+
     main(args)
